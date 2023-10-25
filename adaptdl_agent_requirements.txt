@@ -1,0 +1,13 @@
+PyYAML
+kubernetes
+flask
+MarkupSafe
+docker
+urllib3
+requests
+boto3
+tqdm
+requests
+typing
+setuptools
+requests_futures
