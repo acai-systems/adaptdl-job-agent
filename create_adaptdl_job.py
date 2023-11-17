@@ -18,8 +18,38 @@ print(os.listdir())
 from acaisdk.fileset import FileSet
 from acaisdk.file import File
 
+import sys
+from logging.config import dictConfig
+
+import json
+
 
 app = Flask(__name__)
+
+
+def get_daemonset_definition(namespace, daemonset_name):
+    apps_api = client.AppsV1Api()
+    try:
+        daemonset = apps_api.read_namespaced_daemon_set(daemonset_name, namespace)
+        return daemonset, True
+    except client.rest.ApiException as e:
+        daemonset = {
+            "apiVersion": "apps/v1",
+            "kind": "DaemonSet",
+            "metadata": {"name": "images"},
+            "spec": {
+                "selector": {"matchLabels": {"name": "images"}},
+                "template": {
+                    "metadata": {"labels": {"name": "images"}},
+                    "spec": {
+                        #"tolerations": [{"key": "experiment-reserved", "operator": "Equal", "value": "suhasj", "effect": "NoSchedule"}],
+                        "containers": [],
+                        "imagePullSecrets": [{"name": "regcred"}],
+                    }
+                }
+            }
+        }
+        return daemonset, False
 
 def build_image(model, repository):
     with cd(os.environ['DATA_LAKE_MOUNT_PATH']):
@@ -42,32 +72,29 @@ def build_image(model, repository):
     return template
 
 
-def cache_image(model, template):
-    # Cache job images on all nodes in the cluster.
-    daemonset = {
-        "apiVersion": "apps/v1",
-        "kind": "DaemonSet",
-        "metadata": {"name": "images"},
-        "spec": {
-            "selector": {"matchLabels": {"name": "images"}},
-            "template": {
-                "metadata": {"labels": {"name": "images"}},
-                "spec": {
-                    #"tolerations": [{"key": "experiment-reserved", "operator": "Equal", "value": "suhasj", "effect": "NoSchedule"}],
-                    "containers": [],
-                    "imagePullSecrets": [{"name": "regcred"}],
-                }
-            }
-        }
-    }
 
-    daemonset["spec"]["template"]["spec"]["containers"].append({
-        "name": model,
-        "image": template["spec"]["template"]["spec"]["containers"][0]["image"],
-        "command": ["sleep", "1000000000"],
-    })
+
+def cache_image(model, template):
+    daemonset, does_exist = get_daemonset_definition("acai", "images")
+    if does_exist:
+        daemonset.spec.template.spec.containers.append({
+            "name": model,
+            "image": template["spec"]["template"]["spec"]["containers"][0]["image"],
+            "command": ["sleep", "1000000000"],
+        })
+    else:
+        daemonset["spec"]["template"]["spec"]["containers"].append({
+            "name": model,
+            "image": template["spec"]["template"]["spec"]["containers"][0]["image"],
+            "command": ["sleep", "1000000000"],
+        })
+
+    
     apps_api = client.AppsV1Api()
-    apps_api.create_namespaced_daemon_set("acai", daemonset)
+    if does_exist is False:
+        apps_api.create_namespaced_daemon_set("acai", daemonset)
+    else:
+        apps_api.patch_namespaced_daemon_set("images", "acai", daemonset)
 
     while True:
         # Wait for DaemonSet to be ready.
@@ -77,6 +104,8 @@ def cache_image(model, template):
         print("caching images on all nodes: {}/{}".format(ready, total))    
         if total > 0 and ready >= total: break
         time.sleep(10)
+        print("completed patching")
+
 
 class cd:
     def __init__(self, newPath):
@@ -91,23 +120,25 @@ class cd:
     def __exit__(self, etype, value, traceback):
         os.chdir(self.oldPath)
 
-'''
-job_setting = {
-    "v_cpu": "0.4",
-    "memory": "512Mi",
-    "gpu": "0",
-    "command": "mkdir -p ./my_output/ && (cat Shakespeare/* | python3 wordcount.py ./my_output/)",
-    "container_image": "pytorch/pytorch",
-    'input_file_set': 'shakespeare.works',
-    'output_path': './my_output/',
-    'code': '/wordcount.zip',
-    'description': 'count some words from Shakespeare works',
-    'name': 'my_acai_job_terraform_test'
-}
-'''
+dictConfig({
+    'version': 1,
+    'formatters': {'default': {
+        'format': '[%(asctime)s] %(levelname)s in %(module)s: %(message)s',
+    }},
+    'handlers': {'wsgi': {
+        'class': 'logging.StreamHandler',
+        'stream': 'ext://sys.stdout',  # <-- Solution
+        'formatter': 'default'
+    }},
+    'root': {
+        'level': 'INFO',
+        'handlers': ['wsgi']
+    }
+})
 
 def download_files(jobID):
     jobDetails = requests.get(f"http://job-registry-service.acai.svc.cluster.local:80/job_registry/job?job_id={jobID}").json()
+    print(jobDetails)
     os.environ['JOB_ID'] = jobID
     os.environ['PROJECT_ID'] = str(jobDetails['project_id'])
     os.environ['USER_ID'] = str(jobDetails['user_id']) 
@@ -131,12 +162,12 @@ def download_files(jobID):
         print(os.listdir('helloworld/'))
 
 
-def create_job(jobID, modelName):
+def create_job(jobID, name, application, target_batch_size, target_number_replicas):
     repository = "docker.pdl.cmu.edu/pollux"
     download_files(jobID)
     config.load_incluster_config()
     print(f"Clearing images in kubectl")
-    image_to_build = modelName
+    image_to_build = application
     print(f"Building images: {image_to_build}", flush=True)
     template = build_image(image_to_build, repository)
     print(template)
@@ -144,18 +175,14 @@ def create_job(jobID, modelName):
     objs_api = client.CustomObjectsApi()
     namespace = "acai"
     obj_args = ("adaptdl.petuum.com", "v1", namespace, "adaptdljobs")
-    application = modelName
-    num_replicas = 1
-    batch_size = 320
-    name = modelName
 
     job = copy.deepcopy(template)
     job["metadata"].pop("generateName")
     job["metadata"]["name"] = name
     job["spec"].update({
         "application": application,
-        "targetNumReplicas": num_replicas,
-        "targetBatchSize": batch_size,
+        "targetNumReplicas": target_number_replicas,
+        "targetBatchSize": target_batch_size,
     })
     volumes = job["spec"]["template"]["spec"].setdefault("volumes", [])
     volumes.append({
@@ -195,8 +222,12 @@ def create_job_route():
     print(f'Full Request Data: {request.data}')
     print(f'Headers: {request.headers}')
     jobID = request.json.get('job_id', '')
-    modelName = request.json.get("model_name", '')
-    create_job(jobID, modelName)
+    name = request.json.get("name", '')
+    application = request.json.get("application", '')
+    target_batch_size = request.json.get("targetBatchSize", '')
+    targetNumberReplicas = request.json.get("targetNumberReplicas", '')
+    print(f"job_id {jobID}, name {name}, application {application}, target_batch_size {target_batch_size} targetNumberReplicas {targetNumberReplicas}")
+    create_job(jobID, name, application, target_batch_size, targetNumberReplicas)
     return jsonify({'message': 'Job created successfully'})
 
 if __name__ == "__main__":
