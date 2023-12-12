@@ -20,7 +20,7 @@ import sys
 from logging.config import dictConfig
 
 import json
-
+import redis
 
 import asyncio
 from kubernetes import client, config
@@ -133,6 +133,8 @@ def process_queue():
 
 
 def monitor_adaptdl_jobs():
+    global job_name_id_map
+    global publishers
     while True:
         w = watch.Watch()
         stream = w.stream(
@@ -142,9 +144,31 @@ def monitor_adaptdl_jobs():
             "acai",
             'adaptdljobs'
         )
-        print("existing adaptdljobs")
+        seen_jobs = set()
         for event in stream:
-            print(event)
+            if "raw_object" not in event:
+                continue
+            if "metadata" not in event["raw_object"]:
+                continue
+            if "status" not in event["raw_object"]:
+                continue
+            if "name" not in event["raw_object"]["metadata"]:
+                continue
+            if "phase" not in event["raw_object"]["status"]:
+                continue
+            adaptdl_job_name = event['raw_object']['metadata']['name']
+            job_status = event['raw_object']['status']['phase']
+            print(f"Monitoring adaptdl_job_name: {adaptdl_job_name}, job_status: {job_status}")
+            if "adaptdl_job_name" not in job_name_id_map:
+                continue
+            if job_name_id_map[adaptdl_job_name] not in publishers:
+                continue
+            publishers[job_name_id_map[adaptdl_job_name]].progress(job_status)
+            seen_jobs.add(adaptdl_job_name)
+        for job_name in job_name_id_map:
+            if job_name not in seen_jobs:
+                print(f"AdaptDL job deleted {job_name}, job_status: Completed")
+                publishers[job_name_id_map[adaptdl_job_name]].progress("Completed")
         time.sleep(5)
 
 
@@ -228,7 +252,8 @@ dictConfig({
 
 def download_files(job_id):
     job_details = requests.get(f"http://job-registry-service.acai.svc.cluster.local:80/job_registry/job?job_id={job_id}").json()
-    publishers[job_id].progress("Downloading files")
+    if job_id in publishers:
+        publishers[job_id].progress("Downloading files")
     print(job_details)
     os.environ['JOB_ID'] = job_id
     os.environ['PROJECT_ID'] = str(job_details['project_id'])
